@@ -3,6 +3,9 @@ import sqlite3
 import time
 import requests
 import qrcode
+import os
+from flask import Flask
+import threading
 from io import BytesIO
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -417,8 +420,21 @@ async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="❌ **Payment Verification Failed!** Your payment was rejected."
         )
 
+# Render ke port issue ko fix karne ke liye dummy server
+web_app = Flask('')
+
+@web_app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host='0.0.0.0', port=port)
+
 # ================= MAIN RUNNER =================
 if __name__ == "__main__":
+    threading.Thread(target=run_web).start()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
