@@ -29,6 +29,25 @@ config = {
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
+# Global cache for services
+CACHE_SERVICES = []
+CACHE_TIME = 0
+
+def get_all_services():
+    global CACHE_SERVICES, CACHE_TIME
+    if CACHE_SERVICES and (time.time() - CACHE_TIME < 300):
+        return CACHE_SERVICES
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        req = requests.post(config['smm_url'], data={'key': config['smm_key'], 'action': 'services'}, headers=headers, timeout=10).json()
+        if isinstance(req, list):
+            CACHE_SERVICES = req
+            CACHE_TIME = time.time()
+            return req
+    except Exception as e:
+        logging.error(f"Error fetching services: {e}")
+    return CACHE_SERVICES
+
 # ================= DATABASE SETUP =================
 def init_db():
     conn = sqlite3.connect("smm_bot.db")
@@ -63,6 +82,14 @@ def db_get_user(user_id):
         res = (0.0, 0.0, 0, 0, None)
     conn.close()
     return res
+
+def get_user_markup(user_id):
+    bal, spent, is_reseller, refs, custom_m = db_get_user(user_id)
+    if custom_m is not None:
+        return float(custom_m)
+    if is_reseller or spent >= 350:
+        return config['default_markup'] / 2.0
+    return config['default_markup']
 
 def get_main_reply_keyboard(user_id):
     keyboard = [
@@ -101,8 +128,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🆔 **User ID:** `{user_id}`\n"
         f"🎖 **Status:** {account_type}\n"
-        f"💰 **Balance:** ₹{bal}\n"
-        f"📊 **Total Spent:** ₹{spent}\n"
+        f"💰 **Balance:** ₹{bal:.2f}\n"
+        f"📊 **Total Spent:** ₹{spent:.2f}\n"
         f"👥 **Referrals:** {refs}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"✨ Bottom Keyboard Menu se koi option select karein:"
@@ -167,6 +194,73 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ Valid number enter karein (e.g. 100).")
             return
 
+    # ===== ORDER FLOW: STEP 3 (LINK INPUT) =====
+    if state == 'awaiting_order_link':
+        context.user_data['order_link'] = text
+        context.user_data['state'] = 'awaiting_order_qty'
+        service = context.user_data.get('selected_service')
+        min_q = int(service.get('min', 1))
+        max_q = int(service.get('max', 100000))
+        await update.message.reply_text(
+            f"🔗 **Link Received:** `{text}`\n\n"
+            f"✍️ Ab **Quantity** enter karein:\n"
+            f"📌 Min: `{min_q}` | Max: `{max_q}`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # ===== ORDER FLOW: STEP 4 (QUANTITY INPUT & CONFIRMATION) =====
+    if state == 'awaiting_order_qty':
+        try:
+            qty = int(text)
+            service = context.user_data.get('selected_service')
+            min_q = int(service.get('min', 1))
+            max_q = int(service.get('max', 100000))
+
+            if qty < min_q or qty > max_q:
+                await update.message.reply_text(f"❌ Quantity `{min_q}` se `{max_q}` ke beech honi chahiye.")
+                return
+
+            context.user_data['order_qty'] = qty
+            context.user_data['state'] = None
+
+            # Calculate Price
+            rate_per_1000 = float(service.get('rate', 0))
+            markup = get_user_markup(user_id)
+            final_rate_per_1000 = rate_per_1000 * (1 + markup / 100.0)
+            total_cost = round((final_rate_per_1000 / 1000.0) * qty, 2)
+            context.user_data['total_cost'] = total_cost
+
+            bal, _, _, _, _ = db_get_user(user_id)
+
+            confirm_msg = (
+                f"📋 **ORDER CONFIRMATION**\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"🔹 **Service:** {service.get('name')}\n"
+                f"🔗 **Link:** `{context.user_data.get('order_link')}`\n"
+                f"📊 **Quantity:** `{qty}`\n"
+                f"💰 **Total Price:** ₹{total_cost:.2f}\n"
+                f"💳 **Your Balance:** ₹{bal:.2f}\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+            )
+
+            if bal < total_cost:
+                confirm_msg += "\n❌ **Insufficient Balance!** Please deposit funds first."
+                keyboard = [[InlineKeyboardButton("💳 Deposit Cash", callback_data="pay_custom")]]
+            else:
+                confirm_msg += "\nConfirm order karne ke liye neeche button dabaayein:"
+                keyboard = [
+                    [InlineKeyboardButton("✅ Confirm & Place Order", callback_data="confirm_place_order")],
+                    [InlineKeyboardButton("❌ Cancel Order", callback_data="cancel_order")]
+                ]
+
+            await update.message.reply_text(confirm_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+
+        except ValueError:
+            await update.message.reply_text("❌ Valid quantity number enter karein.")
+            return
+
     if text == "🛒 New Order":
         await fetch_and_show_categories(update, context)
 
@@ -220,7 +314,7 @@ async def show_admin_panel(update, context):
         "━━━━━━━━━━━━━━━━━━━"
     )
     keyboard = [
-        [InlineKeyboardButton("🔄 Import Category & Services", callback_data="adm_import")],
+        [InlineKeyboardButton("🔄 Refresh Services Cache", callback_data="adm_import")],
         [InlineKeyboardButton("⚡ Test API Connection", callback_data="adm_test_api")],
         [InlineKeyboardButton("🔗 Set API URL", callback_data="adm_set_url"), InlineKeyboardButton("🔑 Set API Key", callback_data="adm_set_key")],
         [InlineKeyboardButton("📈 Global Markup %", callback_data="adm_set_markup"), InlineKeyboardButton("👤 User Specific Markup", callback_data="adm_user_markup")],
@@ -232,19 +326,18 @@ async def show_admin_panel(update, context):
     else:
         await update.callback_query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
+# ===== ORDER FLOW: STEP 1 (SHOW CATEGORIES) =====
 async def fetch_and_show_categories(update_or_query, context):
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        req = requests.post(config['smm_url'], data={'key': config['smm_key'], 'action': 'services'}, headers=headers, timeout=10).json()
-        if isinstance(req, list):
-            cats = list(set([s['category'] for s in req if 'category' in s]))[:10]
-            keyboard = [[InlineKeyboardButton(c[:30], callback_data=f"cat_{i}")] for i, c in enumerate(cats)]
-            msg = "📂 **Select Service Category:**"
-        else:
-            msg = "❌ Invalid SMM API Response. Please recheck Key/URL."
-            keyboard = []
-    except Exception as e:
-        msg = f"⚠️ **Connection Error:** {str(e)}"
+    services = get_all_services()
+    if services:
+        categories = list(dict.fromkeys([s['category'] for s in services if 'category' in s]))
+        context.user_data['all_categories'] = categories
+        keyboard = []
+        for idx, cat in enumerate(categories[:25]): # Limit to top 25 categories
+            keyboard.append([InlineKeyboardButton(cat[:35], callback_data=f"cat_{idx}")])
+        msg = "📂 **Select Service Category:**"
+    else:
+        msg = "❌ SMM Services load nahi ho payi. Please Admin Panel me API details check karein."
         keyboard = []
 
     if hasattr(update_or_query, 'message') and update_or_query.message:
@@ -258,7 +351,122 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = query.from_user.id
     data = query.data
 
-    if data.startswith("pay_"):
+    # ===== CATEGORY SELECTED -> SHOW SERVICES =====
+    if data.startswith("cat_"):
+        cat_idx = int(data.split("_")[1])
+        categories = context.user_data.get('all_categories', [])
+        if not categories or cat_idx >= len(categories):
+            services = get_all_services()
+            categories = list(dict.fromkeys([s['category'] for s in services if 'category' in s]))
+            context.user_data['all_categories'] = categories
+
+        selected_cat = categories[cat_idx]
+        context.user_data['selected_category'] = selected_cat
+
+        all_services = get_all_services()
+        cat_services = [s for s in all_services if s.get('category') == selected_cat]
+        context.user_data['cat_services'] = cat_services
+
+        markup = get_user_markup(user_id)
+
+        keyboard = []
+        for idx, srv in enumerate(cat_services[:20]): # Limit items per category
+            rate = float(srv.get('rate', 0)) * (1 + markup / 100.0)
+            btn_text = f"{srv.get('name')[:30]} - ₹{rate:.2f}/k"
+            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"srv_{idx}")])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Back to Categories", callback_data="back_to_cats")])
+
+        await query.edit_message_text(
+            f"📁 **Category:** `{selected_cat}`\n\n👇 **Select Service:**",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    # ===== SERVICE SELECTED -> ASK FOR LINK =====
+    elif data.startswith("srv_"):
+        srv_idx = int(data.split("_")[1])
+        cat_services = context.user_data.get('cat_services', [])
+        if not cat_services or srv_idx >= len(cat_services):
+            await query.edit_message_text("❌ Service detail expire ho gayi. Phir se try karein.")
+            return
+
+        selected_service = cat_services[srv_idx]
+        context.user_data['selected_service'] = selected_service
+        context.user_data['state'] = 'awaiting_order_link'
+
+        rate = float(selected_service.get('rate', 0)) * (1 + get_user_markup(user_id) / 100.0)
+
+        msg = (
+            f"🛒 **Service Selected:**\n"
+            f"📌 **{selected_service.get('name')}**\n\n"
+            f"💵 **Price:** ₹{rate:.2f} per 1000\n"
+            f"📌 **Min:** {selected_service.get('min')} | **Max:** {selected_service.get('max')}\n\n"
+            f"✍️ **Ab Target Link / Username chat me send karein:**"
+        )
+        await query.edit_message_text(msg, parse_mode="Markdown")
+
+    elif data == "back_to_cats":
+        await fetch_and_show_categories(query, context)
+
+    # ===== CONFIRM & PLACE ORDER =====
+    elif data == "confirm_place_order":
+        service = context.user_data.get('selected_service')
+        link = context.user_data.get('order_link')
+        qty = context.user_data.get('order_qty')
+        cost = context.user_data.get('total_cost')
+
+        bal, spent, is_reseller, refs, custom_m = db_get_user(user_id)
+
+        if bal < cost:
+            await query.edit_message_text("❌ Insufficient Balance. Order Cancelled.")
+            return
+
+        # Place Order via API
+        try:
+            payload = {
+                'key': config['smm_key'],
+                'action': 'add',
+                'service': service['service'],
+                'link': link,
+                'quantity': qty
+            }
+            res = requests.post(config['smm_url'], data=payload, timeout=15).json()
+
+            if 'order' in res:
+                order_id = res['order']
+                # Deduct balance
+                conn = sqlite3.connect("smm_bot.db")
+                cursor = conn.cursor()
+                cursor.execute("UPDATE users SET balance = balance - ?, spent = spent + ? WHERE user_id = ?", (cost, cost, user_id))
+                conn.commit()
+                conn.close()
+
+                success_msg = (
+                    f"🎉 **ORDER PLACED SUCCESSFULLY!**\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n"
+                    f"🆔 **Order ID:** `{order_id}`\n"
+                    f"🔹 **Service:** {service.get('name')}\n"
+                    f"🔗 **Link:** `{link}`\n"
+                    f"📊 **Quantity:** `{qty}`\n"
+                    f"💰 **Amount Deducted:** ₹{cost:.2f}\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n"
+                    f"⚡ Speed: Instant / In Progress"
+                )
+                await query.edit_message_text(success_msg, parse_mode="Markdown")
+                context.user_data.clear()
+            else:
+                err = res.get('error', 'API Provider Error')
+                await query.edit_message_text(f"❌ **Order Failed:** `{err}`\nBalance nahi kata hai.", parse_mode="Markdown")
+
+        except Exception as e:
+            await query.edit_message_text(f"❌ **Error placing order:** {str(e)}")
+
+    elif data == "cancel_order":
+        context.user_data.clear()
+        await query.edit_message_text("❌ Order Cancelled.")
+
+    elif data.startswith("pay_"):
         amt_str = data.split("_")[1]
         if amt_str == "custom":
             await query.edit_message_text("✍️ Send custom amount in chat (e.g. `100`):", parse_mode="Markdown")
@@ -267,8 +475,10 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         await trigger_qr_code(query, user_id, float(amt_str))
 
     elif data == "adm_import":
-        await query.edit_message_text("⏳ Syncing categories & services from SMM Panel...")
-        await fetch_and_show_categories(query, context)
+        global CACHE_TIME
+        CACHE_TIME = 0
+        get_all_services()
+        await query.edit_message_text("✅ SMM Services refreshed successfully from SMM Panel!")
 
     elif data == "adm_test_api":
         try:
@@ -313,7 +523,7 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         cursor.execute("SELECT COUNT(*), SUM(spent) FROM users")
         u_cnt, s_total = cursor.fetchone()
         conn.close()
-        msg = f"📊 **Bot Statistics**\n\n👥 Total Users: {u_cnt}\n💰 Total Spent: ₹{s_total or 0.0}"
+        msg = f"📊 **Bot Statistics**\n\n👥 Total Users: {u_cnt}\n💰 Total Spent: ₹{s_total or 0.0:.2f}"
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="btn_admin")]]))
 
     elif data == "paid_check":
@@ -420,7 +630,7 @@ async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="❌ **Payment Verification Failed!** Your payment was rejected."
         )
 
-# Render ke port issue ko fix karne ke liye dummy server
+# Render dummy web server
 web_app = Flask('')
 
 @web_app.route('/')
@@ -438,7 +648,7 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_inline_buttons, pattern="^(pay_|adm_|paid_check|not_paid|btn_admin)"))
+    app.add_handler(CallbackQueryHandler(handle_inline_buttons, pattern="^(cat_|srv_|back_to_cats|confirm_place_order|cancel_order|pay_|adm_|paid_check|not_paid|btn_admin)"))
     app.add_handler(CallbackQueryHandler(admin_action, pattern="^(appr_|reje_)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
     app.add_handler(MessageHandler(filters.PHOTO, process_photo))
